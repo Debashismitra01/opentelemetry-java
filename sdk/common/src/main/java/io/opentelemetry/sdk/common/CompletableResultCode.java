@@ -8,6 +8,7 @@ package io.opentelemetry.sdk.common;
 import io.opentelemetry.api.internal.GuardedBy;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -100,14 +101,18 @@ public final class CompletableResultCode {
 
   /** Complete this {@link CompletableResultCode} successfully if it is not already completed. */
   public CompletableResultCode succeed() {
+    List<Runnable> actions;
     synchronized (lock) {
-      if (succeeded == null) {
-        succeeded = true;
-        for (Runnable action : completionActions) {
-          action.run();
-        }
+      if (succeeded != null) {
+        return this;
       }
+
+      succeeded = true;
+      actions = new ArrayList<>(completionActions);
+      completionActions.clear();
     }
+
+    runCompletionActions(actions);
     return this;
   }
 
@@ -131,16 +136,38 @@ public final class CompletableResultCode {
   }
 
   private CompletableResultCode failInternal(@Nullable Throwable throwable) {
+    List<Runnable> actions;
     synchronized (lock) {
-      if (succeeded == null) {
-        succeeded = false;
-        this.throwable = throwable;
-        for (Runnable action : completionActions) {
-          action.run();
+      if (succeeded != null) {
+        return this;
+      }
+
+      succeeded = false;
+      this.throwable = throwable;
+      actions = new ArrayList<>(completionActions);
+      completionActions.clear();
+    }
+
+    runCompletionActions(actions);
+    return this;
+  }
+
+  private static void runCompletionActions(List<Runnable> actions) {
+    RuntimeException firstFailure = null;
+
+    for (Runnable action : actions) {
+      try {
+        action.run();
+      } catch (RuntimeException e) {
+        if (firstFailure == null) {
+          firstFailure = e;
         }
       }
     }
-    return this;
+
+    if (firstFailure != null) {
+      throw firstFailure;
+    }
   }
 
   /**
@@ -188,7 +215,7 @@ public final class CompletableResultCode {
       }
     }
     if (runNow) {
-      action.run();
+      runCompletionActions(Collections.singletonList(action));
     }
     return this;
   }

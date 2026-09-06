@@ -6,6 +6,7 @@
 package io.opentelemetry.sdk.common;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 import com.google.common.util.concurrent.Uninterruptibles;
@@ -14,6 +15,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -121,6 +123,87 @@ class CompletableResultCodeTest {
     completions.await(3, TimeUnit.SECONDS);
 
     assertThat(resultCode.isSuccess()).isTrue();
+  }
+
+  @Test
+  void completionCallbacksDoNotDeadlockWhenCompletingEachOther() throws InterruptedException {
+    CompletableResultCode first = new CompletableResultCode();
+    CompletableResultCode second = new CompletableResultCode();
+
+    CountDownLatch callbacksEntered = new CountDownLatch(2);
+    CountDownLatch release = new CountDownLatch(1);
+
+    first.whenComplete(
+        () -> {
+          callbacksEntered.countDown();
+          Uninterruptibles.awaitUninterruptibly(release);
+          second.succeed();
+        });
+
+    second.whenComplete(
+        () -> {
+          callbacksEntered.countDown();
+          Uninterruptibles.awaitUninterruptibly(release);
+          first.succeed();
+        });
+
+    Thread firstThread = new Thread(first::succeed);
+    Thread secondThread = new Thread(second::succeed);
+    firstThread.setDaemon(true);
+    secondThread.setDaemon(true);
+
+    firstThread.start();
+    secondThread.start();
+
+    assertThat(callbacksEntered.await(3, TimeUnit.SECONDS)).isTrue();
+
+    release.countDown();
+
+    firstThread.join(3_000);
+    secondThread.join(3_000);
+
+    assertThat(firstThread.isAlive()).isFalse();
+    assertThat(secondThread.isAlive()).isFalse();
+  }
+
+  @Test
+  void callbackExceptionDoesNotPreventLaterCallbacks() {
+    CompletableResultCode resultCode = new CompletableResultCode();
+    AtomicBoolean laterCallbackInvoked = new AtomicBoolean();
+
+    resultCode.whenComplete(
+        () -> {
+          throw new RuntimeException("callback failure");
+        });
+
+    resultCode.whenComplete(() -> laterCallbackInvoked.set(true));
+
+    assertThatThrownBy(resultCode::succeed)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("callback failure");
+
+    assertThat(laterCallbackInvoked).isTrue();
+  }
+
+  @Test
+  void callbackExceptionDoesNotPreventOfAllCompletion() {
+    CompletableResultCode source = new CompletableResultCode();
+    CompletableResultCode other = new CompletableResultCode();
+
+    source.whenComplete(
+        () -> {
+          throw new RuntimeException("callback failure");
+        });
+
+    CompletableResultCode all = CompletableResultCode.ofAll(Arrays.asList(source, other));
+
+    other.succeed();
+
+    assertThatThrownBy(source::succeed)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("callback failure");
+
+    assertThat(all.isDone()).isTrue();
   }
 
   @Test
